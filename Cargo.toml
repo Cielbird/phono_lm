@@ -1,0 +1,30 @@
+[package]
+name = "phono-lm"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+
+[features]
+default = ["burn/dataset", "burn/sqlite-bundled"]
+f16 = []
+
+[dependencies]
+# Burn
+burn = { version = "0.21.0", features = ["train", "tch"] }
+
+# Tokenizer
+tokenizers = { version = "0.22.2", default-features = false, features = [
+    "onig",
+    "http",
+] }
+
+# Utils
+derive-new = { version = "0.7.0", default-features = false }
+log = { default-features = false, version = "0.4.29" }
+serde = { version = "1.0.228", default-features = false, features = [
+    "std",
+    "derive",
+] }
+
+getheode = { path = "../../getheode/" }
