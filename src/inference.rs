@@ -1,11 +1,10 @@
-use burn::{prelude::*, record::{DefaultRecorder, Recorder}};
-use getheode::phonology::{
-    feature::FeatureState,
-    segment::{SEG_FEATURE_COUNT, SegmentFeatures},
+use burn::{
+    prelude::*,
+    record::{DefaultRecorder, Recorder},
 };
 
 use crate::{
-    data::{FEATURES, PhonoToken},
+    data::{PHONO_LOGITS, PhonoGenerationBatch, PhonoToken},
     model::{PhonoGenerationModel, PhonoGenerationModelConfig},
     training::ExperimentConfig,
 };
@@ -32,7 +31,12 @@ pub struct PhonologicalGenerate<'a, B: Backend> {
 
 impl<'a, B: Backend> PhonologicalGenerate<'a, B> {
     pub fn new(model: &'a PhonoGenerationModel<B>, device: &'a B::Device, n_tokens: usize) -> Self {
-        Self { model, device, seed: vec![PhonoToken::WordBoundary], n_tokens }
+        Self {
+            model,
+            device,
+            seed: vec![PhonoToken::WordBoundary],
+            n_tokens,
+        }
     }
 
     /// Set a conditioning IPA seed sequence.
@@ -50,62 +54,40 @@ impl<'a, B: Backend> PhonologicalGenerate<'a, B> {
         let max_seq = self.model.max_seq_length();
 
         for _ in 0..self.n_tokens {
-            let seq_len = context.len().min(max_seq);
+            let seq_len = context.len().min(max_seq - 1);
             let slice = &context[context.len() - seq_len..];
 
-            let mut data = vec![0.0f32; seq_len * FEATURES];
+            let mut data = vec![0.; seq_len * PHONO_LOGITS];
+            let mut mask_pad = vec![true; seq_len];
             for (t, tok) in slice.iter().enumerate() {
-                let arr: [f32; FEATURES] = tok.to_arr();
-                data[t * FEATURES..(t + 1) * FEATURES].copy_from_slice(&arr);
+                let arr = tok.to_probs();
+                data[t * PHONO_LOGITS..(t + 1) * PHONO_LOGITS].copy_from_slice(&arr);
+                mask_pad[t] = false;
             }
 
-            let input = Tensor::<B, 1>::from_floats(data.as_slice(), self.device)
-                .reshape([1, seq_len, FEATURES]);
+            let tokens = Tensor::<B, 1>::from_floats(data.as_slice(), self.device).reshape([
+                1,
+                seq_len,
+                PHONO_LOGITS,
+            ]);
+            let mask_pad = Tensor::<B, 1, Bool>::from_bool(mask_pad.as_slice(), self.device)
+                .reshape([1, seq_len]);
+            let input = PhonoGenerationBatch::new(tokens, mask_pad);
 
-            let output = self.model.forward(input); // [1, seq_len, FEATURES]
+            let output = self.model.infer(input); // [1, seq_len, TOKEN_CLASSES+TOKEN_FEATURES]
 
             let last = output
-                .slice([0..1, (seq_len - 1)..seq_len, 0..FEATURES])
-                .reshape([FEATURES]);
+                .slice([0..1, (seq_len - 1)..seq_len, 0..PHONO_LOGITS])
+                .reshape([PHONO_LOGITS]);
 
             let vals: Vec<f32> = last.into_data().to_vec::<f32>().unwrap();
-            let arr: [f32; FEATURES] = vals.try_into().expect("wrong feature count");
+            let arr: [f32; PHONO_LOGITS] = vals.try_into().expect("wrong feature count");
 
-            let next = snap_to_token(&arr);
-            context.push(next);
+            let next = PhonoToken::from_probs(arr);
+            context.push(next.clone());
             generated.push(next);
         }
 
         generated
     }
-}
-
-/// Decode a continuous model output into a `PhonoToken` by taking the argmax
-/// of each feature triplet (POS, NEG, NA), then enforcing phonological invariants.
-fn snap_to_token(output: &[f32; FEATURES]) -> PhonoToken {
-    if output[0] > 0.5 {
-        return PhonoToken::WordBoundary;
-    }
-    if output[1] > 0.5 {
-        return PhonoToken::SylBoundary;
-    }
-
-    let seg_count = SEG_FEATURE_COUNT as usize;
-    let feat_offset = FEATURES - seg_count * 3; // skip boundary bits and syl triplets
-    let mut seg_features = [FeatureState::NA; SEG_FEATURE_COUNT as usize];
-    for i in 0..seg_count {
-        let base = feat_offset + i * 3;
-        let (pos, neg, na) = (output[base], output[base + 1], output[base + 2]);
-        seg_features[i] = if pos >= neg && pos >= na {
-            FeatureState::POS
-        } else if neg >= na {
-            FeatureState::NEG
-        } else {
-            FeatureState::NA
-        };
-    }
-
-    let mut s = SegmentFeatures::from_features(seg_features);
-    s.enforce_invariants();
-    PhonoToken::from_seg_features(s.features())
 }

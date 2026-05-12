@@ -1,4 +1,12 @@
-use crate::data::{FEATURES, TrainingPhonoGenerationBatch};
+use crate::{
+    data::{
+        PHONO_LOGITS, PhonoGenerationBatch, TOKEN_CLASSES, TOKEN_FEATURES,
+        TrainingPhonoGenerationBatch,
+    },
+    loss::{masked_cross_entropy, masked_multilabel_bce},
+    output::{PhonoClassificationOutput, PhonoGenerationOutput},
+};
+
 use burn::{
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig,
@@ -6,15 +14,16 @@ use burn::{
         transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
     },
     prelude::*,
-    tensor::{activation::sigmoid, backend::AutodiffBackend},
-    train::{InferenceStep, RegressionOutput, TrainOutput, TrainStep},
+    tensor::{
+        activation::{sigmoid, softmax},
+        backend::AutodiffBackend,
+    },
+    train::{InferenceStep, TrainOutput, TrainStep},
 };
 
 #[derive(Config, Debug)]
 pub struct PhonoGenerationModelConfig {
     transformer: TransformerEncoderConfig,
-    #[config(default = "FEATURES")]
-    n_features: usize,
     max_seq_length: usize,
 }
 
@@ -23,23 +32,26 @@ pub struct PhonoGenerationModel<B: Backend> {
     transformer: TransformerEncoder<B>,
     input_proj: Linear<B>,
     embedding_pos: Embedding<B>,
-    output_proj: Linear<B>,
+    output_class: Linear<B>,
+    output_features: Linear<B>,
     max_seq_length: usize,
 }
 
 impl PhonoGenerationModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> PhonoGenerationModel<B> {
-        let input_proj = LinearConfig::new(self.n_features, self.transformer.d_model).init(device);
-        let embedding_pos =
-            EmbeddingConfig::new(self.max_seq_length, self.transformer.d_model).init(device);
+        let d = self.transformer.d_model;
+        let input_proj = LinearConfig::new(PHONO_LOGITS, d).init(device);
+        let embedding_pos = EmbeddingConfig::new(self.max_seq_length, d).init(device);
         let transformer = self.transformer.init(device);
-        let output_proj = LinearConfig::new(self.transformer.d_model, self.n_features).init(device);
+        let output_class = LinearConfig::new(d, TOKEN_CLASSES).init(device);
+        let output_features = LinearConfig::new(d, TOKEN_FEATURES).init(device);
 
         PhonoGenerationModel {
             transformer,
             input_proj,
             embedding_pos,
-            output_proj,
+            output_class,
+            output_features,
             max_seq_length: self.max_seq_length,
         }
     }
@@ -50,113 +62,176 @@ impl<B: Backend> PhonoGenerationModel<B> {
         self.max_seq_length
     }
 
-    /// Raw forward pass: tokens `[batch, seq, FEATURES]` → predictions `[batch, seq, FEATURES]`.
-    pub fn forward(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
-        let [batch_size, seq_length, _] = tokens.dims();
+    /// Raw forward pass:
+    /// - tokens [batch, seq, TOKEN_CLASSES+TOKEN_FEATURES] int
+    /// - mask [batch, seq] bool
+    /// -> predictions
+    fn raw_forward(
+        &self,
+        tokens_inputs: Tensor<B, 3>,
+        mask_pad: Tensor<B, 2, Bool>,
+    ) -> PhonoGenerationOutput<B> {
+        let [batch_size, seq_length, classes_plus_feats] = tokens_inputs.dims();
+        assert_eq!(classes_plus_feats, PHONO_LOGITS);
         let device = &self.devices()[0];
 
-        let tokens = tokens.to_device(device);
+        let inputs = tokens_inputs.to_device(device);
+        let mask_pad = mask_pad.to_device(device);
 
-        let index_positions = Tensor::arange(0..seq_length as i64, device)
-            .reshape([1, seq_length])
-            .repeat_dim(0, batch_size);
-
-        let embedding_positions = self.embedding_pos.forward(index_positions);
-        let projected = self.input_proj.forward(tokens);
-        let embedding = (embedding_positions + projected) / 2;
-
-        let mask_attn = generate_autoregressive_mask::<B>(batch_size, seq_length, device);
-        let encoded = self.transformer.forward(
-            TransformerEncoderInput::new(embedding).mask_attn(mask_attn),
-        );
-
-        sigmoid(self.output_proj.forward(encoded))
-    }
-
-    pub fn forward_training(&self, item: TrainingPhonoGenerationBatch<B>) -> RegressionOutput<B> {
-        let [batch_size, seq_length, n_feats] = item.tokens_inputs.dims();
-        let device = &self.devices()[0];
-
-        let inputs = item.tokens_inputs.to_device(device);
-        let targets = item.targets.to_device(device);
-        let mask_pad = item.mask_pad.to_device(device);
-
+        // Forward pass
         let index_positions = Tensor::arange(0..seq_length as i64, device)
             .reshape([1, seq_length])
             .repeat_dim(0, batch_size);
 
         let embedding_positions = self.embedding_pos.forward(index_positions);
         let projected = self.input_proj.forward(inputs);
-        let embedding = (embedding_positions + projected) / 2;
+        let embedding = embedding_positions + projected;
 
         let mask_attn = generate_autoregressive_mask::<B>(batch_size, seq_length, device);
+
         let encoded = self.transformer.forward(
             TransformerEncoderInput::new(embedding)
                 .mask_pad(mask_pad.clone())
                 .mask_attn(mask_attn),
         );
 
-        let output = sigmoid(self.output_proj.forward(encoded));
+        let token_class_logits = self.output_class.forward(encoded.clone()); // [B, S, 3]
+        let token_features_logits = self.output_features.forward(encoded); // [B, S, F]
+
+        PhonoGenerationOutput {
+            token_class_logits,
+            token_features_logits,
+        }
+    }
+
+    pub fn forward(&self, item: TrainingPhonoGenerationBatch<B>) -> PhonoClassificationOutput<B> {
+        let [batch_size, seq_length, n_feats] = item.tokens_inputs.dims();
+        assert_eq!(n_feats, PHONO_LOGITS);
+        let device = &self.devices()[0];
+
+        let targets = item.targets.to_device(device);
+
+        let PhonoGenerationOutput {
+            token_class_logits: class_logits,
+            token_features_logits: feature_logits,
+        } = self.raw_forward(item.tokens_inputs, item.mask_pad.clone());
+
+        // Split targets
+        let class_targets = targets
+            .clone()
+            .slice([0..batch_size, 0..seq_length, 0..TOKEN_CLASSES])
+            .argmax(2)
+            .reshape([batch_size, seq_length]); // [B, S]
+
+        let feature_targets = targets.clone().slice([
+            0..batch_size,
+            0..seq_length,
+            TOKEN_CLASSES..(TOKEN_CLASSES + TOKEN_FEATURES),
+        ]); // [B, S, F]
+
+        // TOKEN CLASS LOSS
+        let class_loss = self.token_class_loss(
+            batch_size,
+            seq_length,
+            class_logits.clone(),
+            class_targets.clone(),
+            item.mask_pad.clone(),
+        );
+
+        // SEGMENT FEATURE LOSS (masked BCE)
+        let feature_loss = self.token_feature_loss(
+            feature_logits.clone(),
+            feature_targets,
+            class_targets,
+            item.mask_pad,
+        );
+
+        // final loss
+        let loss = class_loss + feature_loss;
+
+        let output = Tensor::cat(vec![class_logits, feature_logits], 2);
         let output_flat = output.reshape([batch_size * seq_length, n_feats]);
         let targets_flat = targets.reshape([batch_size * seq_length, n_feats]);
 
-        // 1.0 for real (non-padding) token positions, broadcast over feature dim
-        let real_mask = mask_pad
-            .reshape([batch_size * seq_length])
-            .float()         // true(pad)→1.0, false(real)→0.0
-            .neg()
-            .add_scalar(1.0) // 0.0(pad), 1.0(real)
-            .reshape([batch_size * seq_length, 1])
-            .repeat_dim(1, n_feats);
+        PhonoClassificationOutput::new(loss, output_flat, targets_flat)
+    }
 
-        // 0.0 for NA feature triplets (structurally determined, not learned),
-        // 1.0 for POS/NEG features and boundary bits — prevents NA domination
-        let na_mask = na_feature_mask(&targets_flat, batch_size * seq_length, n_feats);
+    fn token_class_loss(
+        &self,
+        batch_size: usize,
+        seq_len: usize,
+        class_logits: Tensor<B, 3>,
+        class_targets: Tensor<B, 2, Int>,
+        mask_pad: Tensor<B, 2, Bool>,
+    ) -> Tensor<B, 1> {
+        let logits = class_logits.reshape([batch_size * seq_len, 3]);
+        let targets = class_targets.reshape([batch_size * seq_len]);
+        let mask = (!mask_pad).reshape([batch_size * seq_len]);
 
-        let combined_mask = real_mask * na_mask;
+        masked_cross_entropy(logits, targets, mask)
+    }
 
-        let diff = output_flat.clone() - targets_flat.clone();
-        let loss = (diff.clone() * diff * combined_mask.clone()).sum()
-            / combined_mask.sum().clamp_min(1.0);
+    fn token_feature_loss(
+        &self,
+        feature_logits: Tensor<B, 3>,
+        feature_targets: Tensor<B, 3>,
+        class_targets: Tensor<B, 2, Int>,
+        mask_pad: Tensor<B, 2, Bool>,
+    ) -> Tensor<B, 1> {
+        let [batch_size, seq_length, _] = feature_targets.dims();
 
-        RegressionOutput::new(loss, output_flat, targets_flat)
+        // padding mask -> expand
+        let pad_mask = (!mask_pad)
+            .reshape([batch_size, seq_length, 1])
+            .repeat_dim(2, TOKEN_FEATURES);
+
+        // condition: only when token is segment (index 0)
+        let isnt_boundary = class_targets.equal_elem(0);
+        let cond_mask = isnt_boundary
+            .reshape([batch_size, seq_length, 1])
+            .repeat_dim(2, TOKEN_FEATURES);
+
+        // NA and NEG both encode as 0.0, so training to predict 0 for
+        // inapplicable sub-features is correct; with_invariants() converts
+        // them to NA at inference time.
+        let mask = pad_mask & cond_mask;
+
+        let logits = feature_logits.reshape([batch_size * seq_length, TOKEN_FEATURES]);
+        let targets = feature_targets.reshape([batch_size * seq_length, TOKEN_FEATURES]);
+        let mask = mask.reshape([batch_size * seq_length, TOKEN_FEATURES]);
+
+        masked_multilabel_bce(logits, targets, mask, 1.0)
+    }
+
+    // output: [batch_size, seq_len, class_probabilities + binary feature probabilities]
+    pub fn infer(&self, item: PhonoGenerationBatch<B>) -> Tensor<B, 3> {
+        let PhonoGenerationOutput {
+            token_class_logits,
+            token_features_logits,
+        } = self.raw_forward(item.tokens, item.mask_pad);
+
+        // softmax on the token class logits, and
+        // sigmoid on each binary token feature
+        Tensor::cat(
+            vec![
+                softmax(token_class_logits, 2),
+                sigmoid(token_features_logits),
+            ],
+            2,
+        )
     }
 }
 
-/// Build a loss mask that zeros out feature triplets where the target class is NA.
-///
-/// Each segment feature is encoded as a 3-wide one-hot (POS, NEG, NA). When the
-/// NA slot is 1.0, the feature is structurally inapplicable (e.g. [ant] on a
-/// non-coronal segment). We exclude these from the loss so the model only learns
-/// to distinguish POS from NEG for features that actually matter.
-///
-/// The first two positions (WordBoundary / SylBoundary flags) are always included.
-fn na_feature_mask<B: Backend>(targets: &Tensor<B, 2>, bs_sl: usize, n_feats: usize) -> Tensor<B, 2> {
-    let seg_count = (n_feats - 2) / 3;
-    let device = &targets.device();
-
-    // Feature triplets: [bs_sl, seg_count * 3]
-    let feat = targets.clone().slice([0..bs_sl, 2..n_feats]);
-    // [bs_sl, seg_count, 3]
-    let feat_3d = feat.reshape([bs_sl, seg_count, 3]);
-    // NA indicator (last slot of each triplet): [bs_sl, seg_count, 1]
-    let na = feat_3d.slice([0..bs_sl, 0..seg_count, 2..3]);
-    // Defined mask: 1.0 where not NA, repeated across the triplet: [bs_sl, seg_count, 3]
-    let defined_3d = na.neg().add_scalar(1.0).repeat_dim(2, 3);
-    // Flatten: [bs_sl, seg_count * 3]
-    let defined_flat = defined_3d.reshape([bs_sl, seg_count * 3]);
-
-    // Always include the 2 boundary bits
-    let boundary = Tensor::<B, 2>::ones([bs_sl, 2], device);
-    Tensor::cat(vec![boundary, defined_flat], 1)
-}
 
 impl<B: AutodiffBackend> TrainStep for PhonoGenerationModel<B> {
     type Input = TrainingPhonoGenerationBatch<B>;
-    type Output = RegressionOutput<B>;
+    type Output = PhonoClassificationOutput<B>;
 
-    fn step(&self, item: TrainingPhonoGenerationBatch<B>) -> TrainOutput<RegressionOutput<B>> {
-        let output = self.forward_training(item);
+    fn step(
+        &self,
+        item: TrainingPhonoGenerationBatch<B>,
+    ) -> TrainOutput<PhonoClassificationOutput<B>> {
+        let output = self.forward(item);
         let grads = output.loss.backward();
         TrainOutput::new(self, grads, output)
     }
@@ -164,9 +239,9 @@ impl<B: AutodiffBackend> TrainStep for PhonoGenerationModel<B> {
 
 impl<B: Backend> InferenceStep for PhonoGenerationModel<B> {
     type Input = TrainingPhonoGenerationBatch<B>;
-    type Output = RegressionOutput<B>;
+    type Output = PhonoClassificationOutput<B>;
 
-    fn step(&self, item: TrainingPhonoGenerationBatch<B>) -> RegressionOutput<B> {
-        self.forward_training(item)
+    fn step(&self, item: TrainingPhonoGenerationBatch<B>) -> PhonoClassificationOutput<B> {
+        self.forward(item)
     }
 }

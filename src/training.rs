@@ -1,5 +1,5 @@
 use crate::{
-    data::{PhonoGenerationBatcher, PhonoGenerationItem, FEATURES, PhonoTokenizer},
+    data::{PhonoGenerationBatcher, PhonoGenerationItem, PhonoTokenizer},
     model::PhonoGenerationModelConfig,
 };
 use burn::{
@@ -43,7 +43,6 @@ pub fn train<B: AutodiffBackend, D: Dataset<PhonoGenerationItem> + 'static>(
     let batcher = PhonoGenerationBatcher::new(tokenizer, config.max_seq_length);
 
     let model = PhonoGenerationModelConfig::new(config.transformer.clone(), config.max_seq_length)
-        .with_n_features(FEATURES)
         .init::<B>(&device);
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())

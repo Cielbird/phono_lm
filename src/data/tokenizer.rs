@@ -1,7 +1,6 @@
 use getheode::phonology::{
-    feature::FeatureState,
     segment::{SegmentFeatures, parse_segment},
-    syllable::SYL_FEATURE_COUNT,
+    syllable::SyllableFeatures,
 };
 
 use crate::data::token::PhonoToken;
@@ -13,7 +12,7 @@ impl PhonoTokenizer {
     ///
     /// The input format is whitespace-separated pieces where each piece is
     /// either `WORD_BOUNDARY` or one or more IPA bases (e.g. `k`, `oʊ`, `d̠ʒ`).
-    /// A single piece may contain multiple bases (diphthong, affricate) — each
+    /// A single piece may contain multiple bases (diphthong, affricate), each
     /// base is emitted as its own segment token. A single segment may also span
     /// multiple consecutive pieces if the first piece fails entirely.
     pub fn encode(&self, utterance: &str) -> Option<Vec<PhonoToken>> {
@@ -38,7 +37,7 @@ impl PhonoTokenizer {
                 continue;
             }
 
-            // Piece failed entirely — try concatenating following non-boundary pieces.
+            // Piece failed entirely, try concatenating following non-boundary pieces.
             let (tok, consumed) = try_concat(&pieces[i..]);
             if let Some(t) = tok {
                 tokens.push(t);
@@ -46,7 +45,11 @@ impl PhonoTokenizer {
             i += consumed;
         }
 
-        if tokens.is_empty() { None } else { Some(tokens) }
+        if tokens.is_empty() {
+            None
+        } else {
+            Some(tokens)
+        }
     }
 }
 
@@ -58,7 +61,7 @@ fn parse_ipa_piece(s: &str) -> Vec<PhonoToken> {
     while !remaining.is_empty() {
         match parse_segment(remaining) {
             Ok((rest, feats)) => {
-                tokens.push(make_segment(&feats));
+                tokens.push(make_segment(feats));
                 remaining = rest;
             }
             Err(_) => break,
@@ -81,7 +84,7 @@ fn try_concat(pieces: &[&str]) -> (Option<PhonoToken>, usize) {
         candidate.push_str(next);
 
         if let Ok(("", feats)) = parse_segment(&candidate) {
-            return (Some(make_segment(&feats)), n);
+            return (Some(make_segment(feats)), n);
         }
     }
 
@@ -89,15 +92,17 @@ fn try_concat(pieces: &[&str]) -> (Option<PhonoToken>, usize) {
     (None, 1)
 }
 
-fn make_segment(feats: &SegmentFeatures) -> PhonoToken {
+fn make_segment(feats: SegmentFeatures) -> PhonoToken {
     PhonoToken::Segment {
-        syl_features: [FeatureState::NA; SYL_FEATURE_COUNT as usize],
-        seg_features: *feats.features(),
+        syl_features: SyllableFeatures::new_undef(),
+        seg_features: feats,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use getheode::phonology::feature::FeatureState;
+
     use super::*;
 
     #[test]
@@ -141,7 +146,9 @@ mod tests {
             .encode("d̠ʒ ʌ s t WORD_BOUNDARY l aɪ k WORD_BOUNDARY")
             .unwrap();
         assert!(!tokens.is_empty());
-        let wb = tokens.iter().position(|t| matches!(t, PhonoToken::WordBoundary));
+        let wb = tokens
+            .iter()
+            .position(|t| matches!(t, PhonoToken::WordBoundary));
         assert!(wb.is_some());
     }
 
@@ -151,8 +158,8 @@ mod tests {
         let tokens = tok.encode("k a").unwrap();
         for token in &tokens {
             if let PhonoToken::Segment { seg_features, .. } = token {
-                // Every feature must be POS, NEG, or NA — never UNDEF
-                for f in seg_features.iter() {
+                // Every feature must be POS, NEG, or NA, never UNDEF
+                for f in seg_features.features().iter() {
                     assert!(*f != FeatureState::UNDEF);
                 }
             }
@@ -165,25 +172,11 @@ mod tests {
         let tokens = tok.encode("k a").unwrap();
         for token in &tokens {
             if let PhonoToken::Segment { syl_features, .. } = token {
-                // CHILDES has no syllable structure — syl features stay NA
-                for f in syl_features.iter() {
-                    assert_eq!(*f, FeatureState::NA);
+                // CHILDES has no syllable structure, syl features stay NA
+                for f in syl_features.features().iter() {
+                    assert_ne!(*f, FeatureState::POS);
                 }
             }
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_arr() {
-        let tok = PhonoTokenizer;
-        let tokens = tok.encode("k").unwrap();
-        let arr = tokens[0].to_arr();
-        // Each feature triplet sums to 1.0 (one-hot)
-        use crate::data::token::FEATURES;
-        for i in 0..((FEATURES - 2) / 3) {
-            let base = 2 + i * 3;
-            let sum = arr[base] + arr[base + 1] + arr[base + 2];
-            assert!((sum - 1.0).abs() < 1e-6, "triplet {i} sums to {sum}");
         }
     }
 

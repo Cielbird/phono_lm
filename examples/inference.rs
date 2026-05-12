@@ -1,4 +1,4 @@
-use getheode::phonology::segment::{SegmentFeatures, format_segment};
+use getheode::phonology::segment::format_segment;
 use phono_lm::{
     PhonoToken, PhonoTokenizer,
     inference::{PhonologicalGenerate, load_model},
@@ -13,7 +13,10 @@ type Backend = burn::backend::LibTorch<Elem>;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let artifact_dir = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/text-generation");
+    let artifact_dir = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("/tmp/text-generation");
     let n_tokens: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let seed_ipa: Option<&str> = args.get(3).map(|s| s.as_str());
 
@@ -51,8 +54,7 @@ fn print_tokens(tokens: &[PhonoToken]) {
             PhonoToken::SylBoundary => print!("."),
             PhonoToken::Segment { seg_features, .. } => {
                 // seg_features already has invariants enforced by snap_to_token
-                let seg = SegmentFeatures::from_features(*seg_features);
-                print!("{}", format_segment(&seg));
+                print!("{}", format_segment(seg_features));
             }
         }
     }

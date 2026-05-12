@@ -1,35 +1,58 @@
 use getheode::phonology::{
     feature::FeatureState,
-    segment::SEG_FEATURE_COUNT,
-    syllable::SYL_FEATURE_COUNT,
+    segment::{SEG_FEATURE_COUNT, SegmentFeatures},
+    syllable::{SYL_FEATURE_COUNT, SyllableFeatures},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum PhonoToken {
     WordBoundary,
     SylBoundary,
     Segment {
-        syl_features: [FeatureState; SYL_FEATURE_COUNT as usize],
-        seg_features: [FeatureState; SEG_FEATURE_COUNT as usize],
+        syl_features: SyllableFeatures,
+        seg_features: SegmentFeatures,
     },
 }
 
-// 2 boundary bits + 3 bits per feature (one-hot: POS, NEG, NA/UNDEF)
-pub const FEATURES: usize = 2 + (SYL_FEATURE_COUNT as usize + SEG_FEATURE_COUNT as usize) * 3;
+pub const TOKEN_FEATURES: usize = SYL_FEATURE_COUNT + SEG_FEATURE_COUNT;
+pub const TOKEN_CLASSES: usize = 3; // segment, syl bound, or word bound
+pub const PHONO_LOGITS: usize = TOKEN_CLASSES + TOKEN_FEATURES;
 
 impl PhonoToken {
-    pub fn to_arr(&self) -> [f32; FEATURES] {
-        let mut arr = [0.0f32; FEATURES];
+    /// 3 token classes + syllable and segment binary features
+    /// token classes :
+    /// - 0 : segment with features
+    /// - 1 : syllable boundary
+    /// - 2 : word boundary
+    ///
+    /// segment (and syl) features :
+    /// all binary: 1=POS, 0=NEG or NA (always ignored), and UNDEF impossible
+    ///
+    /// if discriminant is 1 or 2 (word or syllable boundary), the binary segment features are
+    /// irrelevant (NA).
+    /// some segment features are dependent on other segment features, so those are sometimes ignored
+    /// too
+    pub fn to_probs(&self) -> [f32; PHONO_LOGITS] {
+        let mut arr = [0.0; PHONO_LOGITS];
         match self {
-            PhonoToken::WordBoundary => arr[0] = 1.0,
-            PhonoToken::SylBoundary => arr[1] = 1.0,
-            PhonoToken::Segment { syl_features, seg_features } => {
-                for (i, &f) in syl_features.iter().chain(seg_features.iter()).enumerate() {
-                    let base = 2 + i * 3;
-                    match f {
-                        FeatureState::POS => arr[base] = 1.0,
-                        FeatureState::NEG => arr[base + 1] = 1.0,
-                        _ => arr[base + 2] = 1.0, // NA or UNDEF
+            PhonoToken::WordBoundary => arr[2] = 1.,
+            PhonoToken::SylBoundary => arr[1] = 1.,
+            PhonoToken::Segment {
+                syl_features,
+                seg_features,
+            } => {
+                arr[0] = 1.;
+                for (i, &f) in syl_features
+                    .features()
+                    .iter()
+                    .chain(seg_features.features().iter())
+                    .enumerate()
+                {
+                    let base = TOKEN_CLASSES + i;
+                    arr[base] = match f {
+                        FeatureState::POS => 1.,
+                        FeatureState::NEG => 0.,
+                        _ => 0., // NA or UNDEF, ignored in loss func
                     }
                 }
             }
@@ -37,42 +60,30 @@ impl PhonoToken {
         arr
     }
 
-    pub fn from_arr(arr: [f32; FEATURES]) -> Self {
-        if arr[0] > 0.5 {
+    pub fn from_probs(arr: [f32; PHONO_LOGITS]) -> Self {
+        if arr[2] > 0.5 {
             return Self::WordBoundary;
         }
         if arr[1] > 0.5 {
             return Self::SylBoundary;
         }
-        let syl_count = SYL_FEATURE_COUNT as usize;
-        let seg_count = SEG_FEATURE_COUNT as usize;
-        let mut syl_features = [FeatureState::NA; SYL_FEATURE_COUNT as usize];
-        let mut seg_features = [FeatureState::NA; SEG_FEATURE_COUNT as usize];
+        let syl_count = SYL_FEATURE_COUNT;
+        let seg_count = SEG_FEATURE_COUNT;
+        let mut syl_features = [FeatureState::NEG; SYL_FEATURE_COUNT];
+        let mut seg_features = [FeatureState::NEG; SEG_FEATURE_COUNT];
         for i in 0..syl_count {
-            syl_features[i] = argmax_triplet(&arr, 2 + i * 3);
+            if arr[TOKEN_CLASSES + i] > 0.5 {
+                syl_features[i] = FeatureState::POS;
+            }
         }
         for i in 0..seg_count {
-            seg_features[i] = argmax_triplet(&arr, 2 + (syl_count + i) * 3);
+            if arr[TOKEN_CLASSES + SYL_FEATURE_COUNT + i] > 0.5 {
+                seg_features[i] = FeatureState::POS;
+            }
         }
-        Self::Segment { syl_features, seg_features }
-    }
-
-    /// Construct a Segment token from a `SegmentFeatures` array (syl_features left as NA).
-    pub fn from_seg_features(seg_features: &[FeatureState; SEG_FEATURE_COUNT as usize]) -> Self {
         Self::Segment {
-            syl_features: [FeatureState::NA; SYL_FEATURE_COUNT as usize],
-            seg_features: *seg_features,
+            syl_features: SyllableFeatures::from_features(syl_features),
+            seg_features: SegmentFeatures::from_features(seg_features).with_invariants(),
         }
-    }
-}
-
-fn argmax_triplet(arr: &[f32], base: usize) -> FeatureState {
-    let (pos, neg, na) = (arr[base], arr[base + 1], arr[base + 2]);
-    if pos >= neg && pos >= na {
-        FeatureState::POS
-    } else if neg >= na {
-        FeatureState::NEG
-    } else {
-        FeatureState::NA
     }
 }
