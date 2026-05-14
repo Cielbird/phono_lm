@@ -10,11 +10,16 @@ use crate::{
 };
 
 /// Load a trained model from `artifact_dir` (the same path passed to `train`).
-pub fn load_model<B: Backend>(artifact_dir: &str, device: &B::Device) -> PhonoGenerationModel<B> {
+pub fn load_model(artifact_dir: &str, device: &Device) -> PhonoGenerationModel {
     let config = ExperimentConfig::load(format!("{artifact_dir}/config.json"))
         .expect("config.json not found");
-    let model_config =
-        PhonoGenerationModelConfig::new(config.transformer.clone(), config.max_seq_length);
+    let model_config = PhonoGenerationModelConfig::new(
+        config.transformer.clone(),
+        config.transformer.d_model,
+        config.transformer.d_model,
+        config.transformer.d_model,
+        config.max_seq_length,
+    );
     let record = DefaultRecorder::new()
         .load(format!("{artifact_dir}/model").into(), device)
         .expect("model record not found");
@@ -22,15 +27,15 @@ pub fn load_model<B: Backend>(artifact_dir: &str, device: &B::Device) -> PhonoGe
 }
 
 /// Autoregressively generates phonological tokens from a trained model.
-pub struct PhonologicalGenerate<'a, B: Backend> {
-    model: &'a PhonoGenerationModel<B>,
-    device: &'a B::Device,
+pub struct PhonologicalGenerate<'a> {
+    model: &'a PhonoGenerationModel,
+    device: &'a Device,
     seed: Vec<PhonoToken>,
     n_tokens: usize,
 }
 
-impl<'a, B: Backend> PhonologicalGenerate<'a, B> {
-    pub fn new(model: &'a PhonoGenerationModel<B>, device: &'a B::Device, n_tokens: usize) -> Self {
+impl<'a> PhonologicalGenerate<'a> {
+    pub fn new(model: &'a PhonoGenerationModel, device: &'a Device, n_tokens: usize) -> Self {
         Self {
             model,
             device,
@@ -65,12 +70,12 @@ impl<'a, B: Backend> PhonologicalGenerate<'a, B> {
                 mask_pad[t] = false;
             }
 
-            let tokens = Tensor::<B, 1>::from_floats(data.as_slice(), self.device).reshape([
+            let tokens = Tensor::<1>::from_floats(data.as_slice(), self.device).reshape([
                 1,
                 seq_len,
                 PHONO_LOGITS,
             ]);
-            let mask_pad = Tensor::<B, 1, Bool>::from_bool(mask_pad.as_slice(), self.device)
+            let mask_pad = Tensor::<1, Bool>::from_bool(mask_pad.as_slice(), self.device)
                 .reshape([1, seq_len]);
             let input = PhonoGenerationBatch::new(tokens, mask_pad);
 

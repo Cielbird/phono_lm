@@ -1,7 +1,6 @@
 use burn::{
     Tensor,
-    backend::NdArray,
-    tensor::{Transaction, backend::Backend},
+    tensor::{Transaction},
     train::{
         ItemLazy,
         metric::{Adaptor, LossInput},
@@ -9,28 +8,26 @@ use burn::{
 };
 
 // raw output of the model
-pub struct PhonoGenerationOutput<B: Backend> {
-    pub token_class_logits: Tensor<B, 3>, // [batch_size, seq_len, TOK_CLASSES]
-    pub token_features_logits: Tensor<B, 3>, // [batch_size, seq_len, SEGMENT_FEATURES]
+pub struct PhonoGenerationOutput {
+    pub token_class_logits: Tensor<3>, // [batch_size, seq_len, TOK_CLASSES]
+    pub token_features_logits: Tensor<3>, // [batch_size, seq_len, SEGMENT_FEATURES]
 }
 
 /// hierarchical multi-label classification for phonological tokens
 #[derive(new)]
-pub struct PhonoClassificationOutput<B: Backend> {
+pub struct PhonoClassificationOutput {
     /// The loss.
-    pub loss: Tensor<B, 1>,
+    pub loss: Tensor<1>,
 
     /// Shape: \[batch_size, TOKEN_CLASSES+SEGMENT_FEATURES\].
-    pub output: Tensor<B, 2>,
+    pub output: Tensor<2>,
 
     /// The ground truth class index for each sample. Shape: \[batch_size, TOKEN_CLASSES+SEGMENT_FEATURES\].
-    pub targets: Tensor<B, 2>,
+    pub targets: Tensor<2>,
 }
 
-impl<B: Backend> ItemLazy for PhonoClassificationOutput<B> {
-    type ItemSync = PhonoClassificationOutput<NdArray>;
-
-    fn sync(self) -> Self::ItemSync {
+impl ItemLazy for PhonoClassificationOutput {
+    fn sync(self) -> Self {
         let [output, loss, targets] = Transaction::default()
             .register(self.output)
             .register(self.loss)
@@ -49,8 +46,8 @@ impl<B: Backend> ItemLazy for PhonoClassificationOutput<B> {
     }
 }
 
-impl<B: Backend> Adaptor<LossInput<B>> for PhonoClassificationOutput<B> {
-    fn adapt(&self) -> LossInput<B> {
+impl Adaptor<LossInput> for PhonoClassificationOutput {
+    fn adapt(&self) -> LossInput {
         LossInput::new(self.loss.clone())
     }
 }

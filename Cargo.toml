@@ -11,7 +11,7 @@ f16 = []
 
 [dependencies]
 # Burn
-burn = { path = "../burn/crates/burn/", features = ["ndarray", "train", "tch"] }
+burn = { path = "../burn/crates/burn/", features = ["cuda", "metal", "ndarray", "train", "tch"] }
 
 # Tokenizer
 tokenizers = { version = "0.22.2", default-features = false, features = [

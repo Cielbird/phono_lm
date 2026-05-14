@@ -57,13 +57,13 @@ impl IpaChildesDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{
+        PHONO_LOGITS, PhonoGenerationBatcher, PhonoToken, PhonoTokenizer, TOKEN_CLASSES,
+        TrainingPhonoGenerationBatch,
+    };
     use burn::backend::NdArray;
     use burn::data::dataloader::batcher::Batcher;
     use std::sync::Arc;
-    use crate::data::{
-        PhonoGenerationBatcher, PhonoToken, PhonoTokenizer, TrainingPhonoGenerationBatch,
-        PHONO_LOGITS, TOKEN_CLASSES,
-    };
 
     // Run with: cargo test probe_dataset -- --ignored --nocapture
     #[test]
@@ -97,9 +97,18 @@ mod tests {
                     print!("  [{}] {:?} → {} tokens  [", i, item.text, tokens.len());
                     for tok in &tokens {
                         match tok {
-                            PhonoToken::Segment { .. } => { n_segments += 1; print!("S"); }
-                            PhonoToken::SylBoundary    => { n_syl += 1;      print!("|"); }
-                            PhonoToken::WordBoundary   => { n_wb += 1;       print!("#"); }
+                            PhonoToken::Segment { .. } => {
+                                n_segments += 1;
+                                print!("S");
+                            }
+                            PhonoToken::SylBoundary => {
+                                n_syl += 1;
+                                print!("|");
+                            }
+                            PhonoToken::WordBoundary => {
+                                n_wb += 1;
+                                print!("#");
+                            }
                         }
                     }
                     println!("]");
@@ -116,12 +125,14 @@ mod tests {
         // Batch the first 4 items and validate shapes and mask
         let batcher = PhonoGenerationBatcher::new(Arc::new(tokenizer), 32);
         let items: Vec<_> = (0..4).filter_map(|i| train.get(i)).collect();
-        let batch: TrainingPhonoGenerationBatch<NdArray> =
-            batcher.batch(items, &Default::default());
+        let batch: TrainingPhonoGenerationBatch = batcher.batch(items, &Default::default());
 
         let [bs, seq, feats] = batch.tokens_inputs.dims();
-        println!("\nbatch shapes: inputs=[{bs},{seq},{feats}]  targets={:?}  mask={:?}",
-            batch.targets.dims(), batch.mask_pad.dims());
+        println!(
+            "\nbatch shapes: inputs=[{bs},{seq},{feats}]  targets={:?}  mask={:?}",
+            batch.targets.dims(),
+            batch.mask_pad.dims()
+        );
         assert_eq!(feats, PHONO_LOGITS);
         assert_eq!(batch.targets.dims(), [bs, seq, feats]);
         assert_eq!(batch.mask_pad.dims(), [bs, seq]);
@@ -133,7 +144,9 @@ mod tests {
         let mut bad = 0usize;
         for b in 0..bs {
             for t in 0..seq {
-                if mask[b * seq + t] { continue; } // padding target, skip
+                if mask[b * seq + t] {
+                    continue;
+                } // padding target, skip
                 let base = (b * seq + t) * feats;
                 let class_sum: f32 = targets[base..base + TOKEN_CLASSES].iter().sum();
                 if (class_sum - 1.0).abs() > 1e-4 {

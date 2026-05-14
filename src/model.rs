@@ -9,55 +9,77 @@ use crate::{
 
 use burn::{
     nn::{
-        Embedding, EmbeddingConfig, Linear, LinearConfig,
+        Embedding, EmbeddingConfig, Gelu, Linear, LinearConfig,
         attention::generate_autoregressive_mask,
         transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
     },
     prelude::*,
-    tensor::{
-        activation::{sigmoid, softmax},
-        backend::AutodiffBackend,
-    },
+    tensor::activation::{sigmoid, softmax},
     train::{InferenceStep, TrainOutput, TrainStep},
 };
 
 #[derive(Config, Debug)]
 pub struct PhonoGenerationModelConfig {
     transformer: TransformerEncoderConfig,
+    input_proj_hidden: usize,
+    output_class_hidden: usize,
+    output_features_hidden: usize,
     max_seq_length: usize,
 }
 
 #[derive(Module, Debug)]
-pub struct PhonoGenerationModel<B: Backend> {
-    transformer: TransformerEncoder<B>,
-    input_proj: Linear<B>,
-    embedding_pos: Embedding<B>,
-    output_class: Linear<B>,
-    output_features: Linear<B>,
+pub struct PhonoGenerationModel {
+    transformer: TransformerEncoder,
+
+    // input features MLP
+    input_proj_1: Linear,
+    input_proj_2: Linear,
+
+    embedding_pos: Embedding,
+
+    // output class MLP
+    output_class_1: Linear,
+    output_class_2: Linear,
+
+    // output features MLP
+    output_features_1: Linear,
+    output_features_2: Linear,
+
+    gelu: Gelu,
     max_seq_length: usize,
 }
 
 impl PhonoGenerationModelConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> PhonoGenerationModel<B> {
+    pub fn init(&self, device: &Device) -> PhonoGenerationModel {
         let d = self.transformer.d_model;
-        let input_proj = LinearConfig::new(PHONO_LOGITS, d).init(device);
+        let input_proj_1 = LinearConfig::new(PHONO_LOGITS, self.input_proj_hidden).init(device);
+        let input_proj_2 = LinearConfig::new(self.input_proj_hidden, d).init(device);
         let embedding_pos = EmbeddingConfig::new(self.max_seq_length, d).init(device);
         let transformer = self.transformer.init(device);
-        let output_class = LinearConfig::new(d, TOKEN_CLASSES).init(device);
-        let output_features = LinearConfig::new(d, TOKEN_FEATURES).init(device);
+
+        let output_class_1 = LinearConfig::new(d, self.output_class_hidden).init(device);
+        let output_class_2 = LinearConfig::new(self.output_class_hidden, TOKEN_CLASSES).init(device);
+
+        let output_features_1 = LinearConfig::new(d, self.output_features_hidden).init(device);
+        let output_features_2 =
+            LinearConfig::new(self.output_features_hidden, TOKEN_FEATURES).init(device);
 
         PhonoGenerationModel {
             transformer,
-            input_proj,
+            input_proj_1,
+            input_proj_2,
             embedding_pos,
-            output_class,
-            output_features,
+            output_class_1,
+            output_class_2,
+            output_features_1,
+            output_features_2,
             max_seq_length: self.max_seq_length,
+            gelu: Gelu::new(),
         }
     }
 }
 
-impl<B: Backend> PhonoGenerationModel<B> {
+impl PhonoGenerationModel {
     pub fn max_seq_length(&self) -> usize {
         self.max_seq_length
     }
@@ -68,9 +90,9 @@ impl<B: Backend> PhonoGenerationModel<B> {
     /// -> predictions
     fn raw_forward(
         &self,
-        tokens_inputs: Tensor<B, 3>,
-        mask_pad: Tensor<B, 2, Bool>,
-    ) -> PhonoGenerationOutput<B> {
+        tokens_inputs: Tensor<3>,
+        mask_pad: Tensor<2, Bool>,
+    ) -> PhonoGenerationOutput {
         let [batch_size, seq_length, classes_plus_feats] = tokens_inputs.dims();
         assert_eq!(classes_plus_feats, PHONO_LOGITS);
         let device = &self.devices()[0];
@@ -84,10 +106,16 @@ impl<B: Backend> PhonoGenerationModel<B> {
             .repeat_dim(0, batch_size);
 
         let embedding_positions = self.embedding_pos.forward(index_positions);
-        let projected = self.input_proj.forward(inputs);
+
+        // input MLP
+        let inputs = self.input_proj_1.forward(inputs);
+        let inputs = self.gelu.forward(inputs);
+        let projected = self.input_proj_2.forward(inputs);
+
+        // add positional embedding
         let embedding = embedding_positions + projected;
 
-        let mask_attn = generate_autoregressive_mask::<B>(batch_size, seq_length, device);
+        let mask_attn = generate_autoregressive_mask(batch_size, seq_length, device);
 
         let encoded = self.transformer.forward(
             TransformerEncoderInput::new(embedding)
@@ -95,8 +123,13 @@ impl<B: Backend> PhonoGenerationModel<B> {
                 .mask_attn(mask_attn),
         );
 
-        let token_class_logits = self.output_class.forward(encoded.clone()); // [B, S, 3]
-        let token_features_logits = self.output_features.forward(encoded); // [B, S, F]
+        let encoded_class = self.output_class_1.forward(encoded.clone());
+        let encoded_class = self.gelu.forward(encoded_class);
+        let token_class_logits = self.output_class_2.forward(encoded_class); // [B, S, 3]
+
+        let encoded_feats = self.output_features_1.forward(encoded);
+        let encoded_feats = self.gelu.forward(encoded_feats);
+        let token_features_logits = self.output_features_2.forward(encoded_feats); // [B, S, F]
 
         PhonoGenerationOutput {
             token_class_logits,
@@ -104,7 +137,7 @@ impl<B: Backend> PhonoGenerationModel<B> {
         }
     }
 
-    pub fn forward(&self, item: TrainingPhonoGenerationBatch<B>) -> PhonoClassificationOutput<B> {
+    pub fn forward(&self, item: TrainingPhonoGenerationBatch) -> PhonoClassificationOutput {
         let [batch_size, seq_length, n_feats] = item.tokens_inputs.dims();
         assert_eq!(n_feats, PHONO_LOGITS);
         let device = &self.devices()[0];
@@ -160,10 +193,10 @@ impl<B: Backend> PhonoGenerationModel<B> {
         &self,
         batch_size: usize,
         seq_len: usize,
-        class_logits: Tensor<B, 3>,
-        class_targets: Tensor<B, 2, Int>,
-        mask_pad: Tensor<B, 2, Bool>,
-    ) -> Tensor<B, 1> {
+        class_logits: Tensor<3>,
+        class_targets: Tensor<2, Int>,
+        mask_pad: Tensor<2, Bool>,
+    ) -> Tensor<1> {
         let logits = class_logits.reshape([batch_size * seq_len, 3]);
         let targets = class_targets.reshape([batch_size * seq_len]);
         let mask = (!mask_pad).reshape([batch_size * seq_len]);
@@ -173,11 +206,11 @@ impl<B: Backend> PhonoGenerationModel<B> {
 
     fn token_feature_loss(
         &self,
-        feature_logits: Tensor<B, 3>,
-        feature_targets: Tensor<B, 3>,
-        class_targets: Tensor<B, 2, Int>,
-        mask_pad: Tensor<B, 2, Bool>,
-    ) -> Tensor<B, 1> {
+        feature_logits: Tensor<3>,
+        feature_targets: Tensor<3>,
+        class_targets: Tensor<2, Int>,
+        mask_pad: Tensor<2, Bool>,
+    ) -> Tensor<1> {
         let [batch_size, seq_length, _] = feature_targets.dims();
 
         // padding mask -> expand
@@ -204,7 +237,7 @@ impl<B: Backend> PhonoGenerationModel<B> {
     }
 
     // output: [batch_size, seq_len, class_probabilities + binary feature probabilities]
-    pub fn infer(&self, item: PhonoGenerationBatch<B>) -> Tensor<B, 3> {
+    pub fn infer(&self, item: PhonoGenerationBatch) -> Tensor<3> {
         let PhonoGenerationOutput {
             token_class_logits,
             token_features_logits,
@@ -222,26 +255,22 @@ impl<B: Backend> PhonoGenerationModel<B> {
     }
 }
 
+impl TrainStep for PhonoGenerationModel {
+    type Input = TrainingPhonoGenerationBatch;
+    type Output = PhonoClassificationOutput;
 
-impl<B: AutodiffBackend> TrainStep for PhonoGenerationModel<B> {
-    type Input = TrainingPhonoGenerationBatch<B>;
-    type Output = PhonoClassificationOutput<B>;
-
-    fn step(
-        &self,
-        item: TrainingPhonoGenerationBatch<B>,
-    ) -> TrainOutput<PhonoClassificationOutput<B>> {
+    fn step(&self, item: TrainingPhonoGenerationBatch) -> TrainOutput<PhonoClassificationOutput> {
         let output = self.forward(item);
         let grads = output.loss.backward();
         TrainOutput::new(self, grads, output)
     }
 }
 
-impl<B: Backend> InferenceStep for PhonoGenerationModel<B> {
-    type Input = TrainingPhonoGenerationBatch<B>;
-    type Output = PhonoClassificationOutput<B>;
+impl InferenceStep for PhonoGenerationModel {
+    type Input = TrainingPhonoGenerationBatch;
+    type Output = PhonoClassificationOutput;
 
-    fn step(&self, item: TrainingPhonoGenerationBatch<B>) -> PhonoClassificationOutput<B> {
+    fn step(&self, item: TrainingPhonoGenerationBatch) -> PhonoClassificationOutput {
         self.forward(item)
     }
 }

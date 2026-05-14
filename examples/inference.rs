@@ -1,3 +1,4 @@
+use burn::tensor::{CudaDevice, Device, WgpuDevice};
 use getheode::phonology::segment::format_segment;
 use phono_lm::{
     PhonoToken, PhonoTokenizer,
@@ -20,13 +21,13 @@ fn main() {
     let n_tokens: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let seed_ipa: Option<&str> = args.get(3).map(|s| s.as_str());
 
-    let device = if cfg!(target_os = "macos") {
-        burn::tensor::Device::<Backend>::Mps
+    let device: Device = if cfg!(target_os = "macos") {
+        WgpuDevice::default().into()
     } else {
-        burn::tensor::Device::<Backend>::Cuda(0)
+        CudaDevice::default().into()
     };
 
-    let model = load_model::<Backend>(artifact_dir, &device);
+    let model = load_model(artifact_dir, &device);
 
     let seed = seed_ipa.and_then(|ipa| {
         let tokens = PhonoTokenizer.encode(ipa);

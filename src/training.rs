@@ -12,7 +12,6 @@ use burn::{
     optim::AdamConfig,
     prelude::*,
     record::{CompactRecorder, DefaultRecorder, Recorder},
-    tensor::backend::AutodiffBackend,
     train::{
         Learner, SupervisedTraining,
         metric::{CudaMetric, LearningRateMetric, LossMetric},
@@ -32,8 +31,8 @@ pub struct ExperimentConfig {
     pub num_epochs: usize,
 }
 
-pub fn train<B: AutodiffBackend, D: Dataset<PhonoGenerationItem> + 'static>(
-    device: B::Device,
+pub fn train<D: Dataset<PhonoGenerationItem> + 'static>(
+    device: Device,
     dataset_train: D,
     dataset_test: D,
     config: ExperimentConfig,
@@ -42,8 +41,14 @@ pub fn train<B: AutodiffBackend, D: Dataset<PhonoGenerationItem> + 'static>(
     let tokenizer = Arc::new(PhonoTokenizer);
     let batcher = PhonoGenerationBatcher::new(tokenizer, config.max_seq_length);
 
-    let model = PhonoGenerationModelConfig::new(config.transformer.clone(), config.max_seq_length)
-        .init::<B>(&device);
+    let model = PhonoGenerationModelConfig::new(
+        config.transformer.clone(),
+        config.transformer.d_model,
+        config.transformer.d_model,
+        config.transformer.d_model,
+        config.max_seq_length,
+    )
+    .init(&device);
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
         .batch_size(config.batch_size)

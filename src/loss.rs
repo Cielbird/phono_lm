@@ -1,13 +1,13 @@
-use burn::tensor::{Bool, Int, Tensor, activation::log_softmax, backend::Backend};
+use burn::tensor::{Bool, Int, Tensor, activation::log_softmax};
 
 /// logits: [B, C]  — raw (pre-softmax) scores
 /// targets: [B]    — class indices
 /// mask: [B]       — true = include this sample in the loss
-pub fn masked_cross_entropy<B: Backend>(
-    logits: Tensor<B, 2>,
-    targets: Tensor<B, 1, Int>,
-    mask: Tensor<B, 1, Bool>,
-) -> Tensor<B, 1> {
+pub fn masked_cross_entropy(
+    logits: Tensor<2>,
+    targets: Tensor<1, Int>,
+    mask: Tensor<1, Bool>,
+) -> Tensor<1> {
     let [batch_size, _num_classes] = logits.dims();
 
     // 1. Log-softmax over class dimension
@@ -35,12 +35,12 @@ pub fn masked_cross_entropy<B: Backend>(
 /// pos_weight  — multiplier applied to positive-target (1.0) entries to compensate
 ///               for the NEG-heavy imbalance typical in phonological feature sets.
 ///               1.0 = unweighted; ~5.0 suits ~85% NEG / 15% POS distributions.
-pub fn masked_multilabel_bce<B: Backend>(
-    logits: Tensor<B, 2>,
-    targets: Tensor<B, 2>,
-    mask: Tensor<B, 2, Bool>,
+pub fn masked_multilabel_bce(
+    logits: Tensor<2>,
+    targets: Tensor<2>,
+    mask: Tensor<2, Bool>,
     pos_weight: f32,
-) -> Tensor<B, 1> {
+) -> Tensor<1> {
     // 1. Numerically stable BCE per (sample, label)
     let zeros = Tensor::zeros_like(&logits);
     let relu_logits = logits.clone().max_pair(zeros);

@@ -1,4 +1,5 @@
 use burn::optim::decay::WeightDecayConfig;
+use burn::tensor::{CudaDevice, WgpuDevice};
 use phono_lm::training;
 use phono_lm::{IpaChildesDataset, training::ExperimentConfig};
 
@@ -16,11 +17,11 @@ fn main() {
     )
     .with_max_seq_length(128);
 
-    training::train::<Backend, IpaChildesDataset>(
+    training::train::<IpaChildesDataset>(
         if cfg!(target_os = "macos") {
-            burn::tensor::Device::<Backend>::Mps
+            WgpuDevice::default().into()
         } else {
-            burn::tensor::Device::<Backend>::Cuda(0)
+            CudaDevice::default().into()
         },
         IpaChildesDataset::train(),
         IpaChildesDataset::test(),

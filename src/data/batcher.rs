@@ -11,26 +11,26 @@ pub struct PhonoGenerationBatcher {
 }
 
 #[derive(Debug, Clone, new)]
-pub struct PhonoGenerationBatch<B: Backend> {
-    pub tokens: Tensor<B, 3>,         // [batch, seq, FEATURES]
-    pub mask_pad: Tensor<B, 2, Bool>, // [batch, seq], true = pad
+pub struct PhonoGenerationBatch {
+    pub tokens: Tensor<3>,         // [batch, seq, FEATURES]
+    pub mask_pad: Tensor<2, Bool>, // [batch, seq], true = pad
 }
 
 #[derive(Debug, Clone, new)]
-pub struct TrainingPhonoGenerationBatch<B: Backend> {
-    pub tokens_inputs: Tensor<B, 3>,  // [batch, seq-1, FEATURES]
-    pub targets: Tensor<B, 3>,        // [batch, seq-1, FEATURES]
-    pub mask_pad: Tensor<B, 2, Bool>, // [batch, seq-1], true when pad
+pub struct TrainingPhonoGenerationBatch {
+    pub tokens_inputs: Tensor<3>,  // [batch, seq-1, FEATURES]
+    pub targets: Tensor<3>,        // [batch, seq-1, FEATURES]
+    pub mask_pad: Tensor<2, Bool>, // [batch, seq-1], true when pad
 }
 
-impl<B: Backend> Batcher<B, PhonoGenerationItem, PhonoGenerationBatch<B>>
+impl Batcher<PhonoGenerationItem, PhonoGenerationBatch>
     for PhonoGenerationBatcher
 {
     fn batch(
         &self,
         items: Vec<PhonoGenerationItem>,
-        device: &B::Device,
-    ) -> PhonoGenerationBatch<B> {
+        device: &Device,
+    ) -> PhonoGenerationBatch {
         let batch_size = items.len();
         let seq_len = self.max_seq_length;
 
@@ -47,28 +47,28 @@ impl<B: Backend> Batcher<B, PhonoGenerationItem, PhonoGenerationBatch<B>>
             }
         }
 
-        let tokens = Tensor::<B, 1>::from_floats(token_data.as_slice(), device).reshape([
+        let tokens = Tensor::<1>::from_floats(token_data.as_slice(), device).reshape([
             batch_size,
             seq_len,
             PHONO_LOGITS,
         ]);
 
-        let mask_pad = Tensor::<B, 1, Bool>::from_bool(mask_data.as_slice(), device)
+        let mask_pad = Tensor::<1, Bool>::from_bool(mask_data.as_slice(), device)
             .reshape([batch_size, seq_len]);
 
         PhonoGenerationBatch { tokens, mask_pad }
     }
 }
 
-impl<B: Backend> Batcher<B, PhonoGenerationItem, TrainingPhonoGenerationBatch<B>>
+impl Batcher<PhonoGenerationItem, TrainingPhonoGenerationBatch>
     for PhonoGenerationBatcher
 {
     fn batch(
         &self,
         items: Vec<PhonoGenerationItem>,
-        device: &B::Device,
-    ) -> TrainingPhonoGenerationBatch<B> {
-        let item: PhonoGenerationBatch<B> = self.batch(items, device);
+        device: &Device,
+    ) -> TrainingPhonoGenerationBatch {
+        let item: PhonoGenerationBatch = self.batch(items, device);
         let [batch_size, seq_length, n_feats] = item.tokens.dims();
 
         let tokens_inputs =
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn shift_is_correct() {
         let device = Default::default();
-        let batch: TrainingPhonoGenerationBatch<B> =
+        let batch: TrainingPhonoGenerationBatch =
             make_batcher(5).batch(vec![item("k a")], &device);
 
         let [_, seq, feats] = batch.tokens_inputs.dims();
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn mask_keyed_to_targets() {
         let device = Default::default();
-        let batch: TrainingPhonoGenerationBatch<B> =
+        let batch: TrainingPhonoGenerationBatch =
             make_batcher(5).batch(vec![item("k a")], &device);
 
         let mask: Vec<bool> = batch.mask_pad.into_data().to_vec().unwrap();
@@ -152,7 +152,7 @@ mod tests {
         let device = Default::default();
         // "k WORD_BOUNDARY a" → [seg(k), word_boundary, seg(a)]
         // targets = [word_boundary, seg(a), PAD], mask = [false, false, true]
-        let batch: TrainingPhonoGenerationBatch<B> =
+        let batch: TrainingPhonoGenerationBatch =
             make_batcher(4).batch(vec![item("k WORD_BOUNDARY a")], &device);
 
         let mask: Vec<bool> = batch.mask_pad.into_data().to_vec().unwrap();
