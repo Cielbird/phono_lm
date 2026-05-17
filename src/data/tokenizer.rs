@@ -1,7 +1,4 @@
-use getheode::phonology::{
-    segment::{SegmentFeatures, parse_segment},
-    syllable::SyllableFeatures,
-};
+use getheode::phonology::segment::{SegmentFeatures, parse_segment};
 
 use crate::data::token::PhonoToken;
 
@@ -94,7 +91,6 @@ fn try_concat(pieces: &[&str]) -> (Option<PhonoToken>, usize) {
 
 fn make_segment(feats: SegmentFeatures) -> PhonoToken {
     PhonoToken::Segment {
-        syl_features: SyllableFeatures::new_undef(),
         seg_features: feats,
     }
 }
@@ -161,20 +157,6 @@ mod tests {
                 // Every feature must be POS, NEG, or NA, never UNDEF
                 for f in seg_features.features().iter() {
                     assert!(*f != FeatureState::UNDEF);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_syl_features_are_na_for_childes() {
-        let tok = PhonoTokenizer;
-        let tokens = tok.encode("k a").unwrap();
-        for token in &tokens {
-            if let PhonoToken::Segment { syl_features, .. } = token {
-                // CHILDES has no syllable structure, syl features stay NA
-                for f in syl_features.features().iter() {
-                    assert_ne!(*f, FeatureState::POS);
                 }
             }
         }

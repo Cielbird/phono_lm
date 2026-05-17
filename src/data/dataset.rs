@@ -58,10 +58,9 @@ impl IpaChildesDataset {
 mod tests {
     use super::*;
     use crate::data::{
-        PHONO_LOGITS, PhonoGenerationBatcher, PhonoToken, PhonoTokenizer, TOKEN_CLASSES,
+        PAD_TOKEN, PhonoGenerationBatcher, PhonoToken, PhonoTokenizer, PhonoVocab,
         TrainingPhonoGenerationBatch,
     };
-    use burn::backend::NdArray;
     use burn::data::dataloader::batcher::Batcher;
     use std::sync::Arc;
 
@@ -123,22 +122,24 @@ mod tests {
         println!("  untokenizable   : {n_untokenizable}");
 
         // Batch the first 4 items and validate shapes and mask
-        let batcher = PhonoGenerationBatcher::new(Arc::new(tokenizer), 32);
+        let vocab = Arc::new(PhonoVocab::build(&[&train, &test], &tokenizer));
+        let vocab_size = vocab.vocab_size();
+        let batcher = PhonoGenerationBatcher::new(Arc::new(tokenizer), vocab, 32);
         let items: Vec<_> = (0..4).filter_map(|i| train.get(i)).collect();
-        let batch: TrainingPhonoGenerationBatch = batcher.batch(items, &Default::default());
+        let batch: TrainingPhonoGenerationBatch =
+            batcher.batch(items, &burn::tensor::WgpuDevice::default().into());
 
-        let [bs, seq, feats] = batch.tokens_inputs.dims();
+        let [bs, seq] = batch.tokens_inputs.dims();
         println!(
-            "\nbatch shapes: inputs=[{bs},{seq},{feats}]  targets={:?}  mask={:?}",
+            "\nbatch shapes: inputs=[{bs},{seq}]  targets={:?}  mask={:?}",
             batch.targets.dims(),
             batch.mask_pad.dims()
         );
-        assert_eq!(feats, PHONO_LOGITS);
-        assert_eq!(batch.targets.dims(), [bs, seq, feats]);
+        assert_eq!(batch.targets.dims(), [bs, seq]);
         assert_eq!(batch.mask_pad.dims(), [bs, seq]);
 
-        // Every unmasked target position must have exactly one hot class bit set
-        let targets: Vec<f32> = batch.targets.clone().into_data().to_vec().unwrap();
+        // Every unmasked target must be a valid token ID in [0, VOCAB_SIZE)
+        let targets: Vec<i32> = batch.targets.clone().into_data().to_vec().unwrap();
         let mask: Vec<bool> = batch.mask_pad.into_data().to_vec().unwrap();
 
         let mut bad = 0usize;
@@ -146,16 +147,18 @@ mod tests {
             for t in 0..seq {
                 if mask[b * seq + t] {
                     continue;
-                } // padding target, skip
-                let base = (b * seq + t) * feats;
-                let class_sum: f32 = targets[base..base + TOKEN_CLASSES].iter().sum();
-                if (class_sum - 1.0).abs() > 1e-4 {
+                }
+                let id = targets[b * seq + t] as usize;
+                if id == PAD_TOKEN || id >= vocab_size {
                     bad += 1;
-                    println!("  BAD class encoding at batch={b} pos={t}: sum={class_sum}");
+                    println!("  BAD token id={id} at batch={b} pos={t}");
                 }
             }
         }
-        assert_eq!(bad, 0, "{bad} target positions have invalid class one-hots");
-        println!("\nAll unmasked target positions have valid class one-hots. ✓");
+        assert_eq!(
+            bad, 0,
+            "{bad} unmasked target positions have invalid token IDs"
+        );
+        println!("\nAll unmasked target positions have valid token IDs. ✓");
     }
 }

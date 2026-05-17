@@ -1,5 +1,5 @@
 use crate::{
-    data::{PhonoGenerationBatcher, PhonoGenerationItem, PhonoTokenizer},
+    data::{PAD_TOKEN, PhonoGenerationBatcher, PhonoGenerationItem, PhonoTokenizer, PhonoVocab},
     model::PhonoGenerationModelConfig,
 };
 use burn::{
@@ -14,7 +14,7 @@ use burn::{
     record::{CompactRecorder, DefaultRecorder, Recorder},
     train::{
         Learner, SupervisedTraining,
-        metric::{CudaMetric, LearningRateMetric, LossMetric},
+        metric::{AccuracyMetric, CudaMetric, LearningRateMetric, LossMetric},
     },
 };
 use std::sync::Arc;
@@ -38,14 +38,23 @@ pub fn train<D: Dataset<PhonoGenerationItem> + 'static>(
     config: ExperimentConfig,
     artifact_dir: &str,
 ) {
+    std::fs::create_dir_all(artifact_dir).expect("failed to create artifact dir");
+
     let tokenizer = Arc::new(PhonoTokenizer);
-    let batcher = PhonoGenerationBatcher::new(tokenizer, config.max_seq_length);
+
+    let vocab = PhonoVocab::build(&[&dataset_train, &dataset_test], &tokenizer);
+    vocab
+        .save(&format!("{artifact_dir}/vocab.json"))
+        .expect("failed to save vocab");
+    let vocab = Arc::new(vocab);
+
+    let batcher = PhonoGenerationBatcher::new(tokenizer, vocab.clone(), config.max_seq_length);
+    let device = device.autodiff();
 
     let model = PhonoGenerationModelConfig::new(
         config.transformer.clone(),
-        config.transformer.d_model,
-        config.transformer.d_model,
-        config.transformer.d_model,
+        vocab.vocab_size(),
+        PAD_TOKEN,
         config.max_seq_length,
     )
     .init(&device);
@@ -72,6 +81,8 @@ pub fn train<D: Dataset<PhonoGenerationItem> + 'static>(
         .metric_valid(CudaMetric::new())
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(LearningRateMetric::new())
         .with_file_checkpointer(CompactRecorder::new())
         .num_epochs(config.num_epochs)

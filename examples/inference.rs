@@ -5,13 +5,6 @@ use phono_lm::{
     inference::{PhonologicalGenerate, load_model},
 };
 
-#[cfg(feature = "f16")]
-type Elem = burn::tensor::f16;
-#[cfg(not(feature = "f16"))]
-type Elem = f32;
-
-type Backend = burn::backend::LibTorch<Elem>;
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let artifact_dir = args
@@ -27,7 +20,7 @@ fn main() {
         CudaDevice::default().into()
     };
 
-    let model = load_model(artifact_dir, &device);
+    let (model, vocab) = load_model(artifact_dir, &device);
 
     let seed = seed_ipa.and_then(|ipa| {
         let tokens = PhonoTokenizer.encode(ipa);
@@ -37,7 +30,7 @@ fn main() {
         tokens
     });
 
-    let generator = PhonologicalGenerate::new(&model, &device, n_tokens);
+    let generator = PhonologicalGenerate::new(&model, &vocab, &device, n_tokens);
     let generator = match seed {
         Some(s) => generator.with_seed(s),
         None => generator,

@@ -4,47 +4,53 @@ use burn::{
 };
 
 use crate::{
-    data::{PHONO_LOGITS, PhonoGenerationBatch, PhonoToken},
+    data::{PAD_TOKEN, PhonoGenerationBatch, PhonoToken, PhonoVocab},
     model::{PhonoGenerationModel, PhonoGenerationModelConfig},
     training::ExperimentConfig,
 };
 
-/// Load a trained model from `artifact_dir` (the same path passed to `train`).
-pub fn load_model(artifact_dir: &str, device: &Device) -> PhonoGenerationModel {
+pub fn load_model(artifact_dir: &str, device: &Device) -> (PhonoGenerationModel, PhonoVocab) {
     let config = ExperimentConfig::load(format!("{artifact_dir}/config.json"))
         .expect("config.json not found");
+    let vocab =
+        PhonoVocab::load(&format!("{artifact_dir}/vocab.json")).expect("vocab.json not found");
     let model_config = PhonoGenerationModelConfig::new(
         config.transformer.clone(),
-        config.transformer.d_model,
-        config.transformer.d_model,
-        config.transformer.d_model,
+        vocab.vocab_size(),
+        PAD_TOKEN,
         config.max_seq_length,
     );
     let record = DefaultRecorder::new()
         .load(format!("{artifact_dir}/model").into(), device)
         .expect("model record not found");
-    model_config.init(device).load_record(record)
+    let model = model_config.init(device).load_record(record);
+    (model, vocab)
 }
 
-/// Autoregressively generates phonological tokens from a trained model.
 pub struct PhonologicalGenerate<'a> {
     model: &'a PhonoGenerationModel,
+    vocab: &'a PhonoVocab,
     device: &'a Device,
     seed: Vec<PhonoToken>,
     n_tokens: usize,
 }
 
 impl<'a> PhonologicalGenerate<'a> {
-    pub fn new(model: &'a PhonoGenerationModel, device: &'a Device, n_tokens: usize) -> Self {
+    pub fn new(
+        model: &'a PhonoGenerationModel,
+        vocab: &'a PhonoVocab,
+        device: &'a Device,
+        n_tokens: usize,
+    ) -> Self {
         Self {
             model,
+            vocab,
             device,
             seed: vec![PhonoToken::WordBoundary],
             n_tokens,
         }
     }
 
-    /// Set a conditioning IPA seed sequence.
     pub fn with_seed(mut self, seed: Vec<PhonoToken>) -> Self {
         if !seed.is_empty() {
             self.seed = seed;
@@ -52,7 +58,6 @@ impl<'a> PhonologicalGenerate<'a> {
         self
     }
 
-    /// Run generation and return the newly produced tokens (seed not included).
     pub fn run(self) -> Vec<PhonoToken> {
         let mut context = self.seed;
         let mut generated = Vec::with_capacity(self.n_tokens);
@@ -62,33 +67,28 @@ impl<'a> PhonologicalGenerate<'a> {
             let seq_len = context.len().min(max_seq - 1);
             let slice = &context[context.len() - seq_len..];
 
-            let mut data = vec![0.; seq_len * PHONO_LOGITS];
-            let mut mask_pad = vec![true; seq_len];
-            for (t, tok) in slice.iter().enumerate() {
-                let arr = tok.to_probs();
-                data[t * PHONO_LOGITS..(t + 1) * PHONO_LOGITS].copy_from_slice(&arr);
-                mask_pad[t] = false;
-            }
+            let token_ids: Vec<i32> = slice.iter().map(|t| self.vocab.to_id(t) as i32).collect();
+            let mask_pad: Vec<bool> = vec![false; seq_len];
 
-            let tokens = Tensor::<1>::from_floats(data.as_slice(), self.device).reshape([
-                1,
-                seq_len,
-                PHONO_LOGITS,
-            ]);
+            let tokens = Tensor::<1, Int>::from_ints(token_ids.as_slice(), self.device)
+                .reshape([1, seq_len]);
             let mask_pad = Tensor::<1, Bool>::from_bool(mask_pad.as_slice(), self.device)
                 .reshape([1, seq_len]);
-            let input = PhonoGenerationBatch::new(tokens, mask_pad);
 
-            let output = self.model.infer(input); // [1, seq_len, TOKEN_CLASSES+TOKEN_FEATURES]
+            let probs = self
+                .model
+                .infer(PhonoGenerationBatch::new(tokens, mask_pad));
+            let last_probs = probs
+                .slice([0..1, (seq_len - 1)..seq_len])
+                .squeeze::<1>(); // [VOCAB_SIZE]
 
-            let last = output
-                .slice([0..1, (seq_len - 1)..seq_len, 0..PHONO_LOGITS])
-                .reshape([PHONO_LOGITS]);
+            let next_id = last_probs.argmax(0).into_scalar() as usize;
+            let next = if next_id == PAD_TOKEN {
+                PhonoToken::WordBoundary
+            } else {
+                self.vocab.from_id(next_id)
+            };
 
-            let vals: Vec<f32> = last.into_data().to_vec::<f32>().unwrap();
-            let arr: [f32; PHONO_LOGITS] = vals.try_into().expect("wrong feature count");
-
-            let next = PhonoToken::from_probs(arr);
             context.push(next.clone());
             generated.push(next);
         }
